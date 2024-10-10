@@ -1,0 +1,67 @@
+#include <windows.h>
+#include <iostream>
+#include <string>
+
+using namespace std;
+
+int main() {
+    // COMポートの設定（ワイド文字列を使用）
+    const wchar_t* portName = L"COM3"; // 使用するCOMポート
+    HANDLE hSerial = CreateFileW(portName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+    if (hSerial == INVALID_HANDLE_VALUE) {
+        cerr << "Error opening port: " << GetLastError() << endl;
+        return 1;
+    }
+
+    // 通信パラメータの設定
+    DCB dcbSerialParams = { 0 };
+    dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
+
+    if (!GetCommState(hSerial, &dcbSerialParams)) {
+        cerr << "Error getting port state: " << GetLastError() << endl;
+        CloseHandle(hSerial);
+        return 1;
+    }
+
+    dcbSerialParams.BaudRate = CBR_9600;  // ボーレート
+    dcbSerialParams.ByteSize = 8;          // データビット
+    dcbSerialParams.StopBits = ONESTOPBIT; // ストップビット
+    dcbSerialParams.Parity = NOPARITY;     // パリティ
+
+    if (!SetCommState(hSerial, &dcbSerialParams)) {
+        cerr << "Error setting port state: " << GetLastError() << endl;
+        CloseHandle(hSerial);
+        return 1;
+    }
+
+    // データの送信
+    string dataToSend = "Hello, UART!";
+    DWORD bytesWritten;
+    // char*をstringからconst char*に変換するための準備
+    char buffer[256];
+    strcpy_s(buffer, dataToSend.c_str());
+
+    if (!WriteFile(hSerial, buffer, dataToSend.length(), &bytesWritten, NULL)) {
+        cerr << "Error writing to port: " << GetLastError() << endl;
+        CloseHandle(hSerial);
+        return 1;
+    }
+
+    cout << "Sent: " << dataToSend << endl;
+
+    // データの受信
+    char receiveBuffer[256];
+    DWORD bytesRead;
+
+    while (true) {
+        if (ReadFile(hSerial, receiveBuffer, sizeof(receiveBuffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+            receiveBuffer[bytesRead] = '\0'; // null-terminate the string
+            cout << "Received: " << receiveBuffer << endl;
+        }
+    }
+
+    // ポートのクローズ
+    CloseHandle(hSerial);
+    return 0;
+}
