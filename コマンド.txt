@@ -5,26 +5,27 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
+
 #include <pigpio.h>
+
 #include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
 #include <opencv2/imgproc.hpp>
+
 #include <vector>
 #include <thread>
 
 using namespace std;
 using namespace cv;
 
-// 設定
-char pc_ip[] = "192.168.0.227";
+char pc_ip[] = "192.168.23.5";          // 通信先PC
 int ras_recv_port = 9001;
-int port_pc_cam1 = 8081;
-int port_pc_cam2 = 8082;
-int baudRate = 9600;
-int fps = 20;
-int msgNum = 2;
+int port_pc_cam1 = 8081;                 // サブカメラ1
+int port_pc_cam2 = 8082;                 // サブカメラ2
+int baudRate = 9600;                     // BPS
+int fps = 20;                            // フレームレート
 
 void thread_cv(int port, int WIDTH, int HEIGHT, int num, int ratio);
 
@@ -36,11 +37,6 @@ int main() {
         return -1;
     }
 
-    // UDP受信バッファ拡大（例：256KB）
-    int bufsize = 256 * 1024;
-    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-
-    // ソケットアドレス設定
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_addr.s_addr = INADDR_ANY;
@@ -52,40 +48,37 @@ int main() {
         return -1;
     }
 
-    // 非ブロッキングモード設定
     int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);  // 非ブロッキング
 
-    // pigpio初期化
+    fd_set readfds;
+    sockaddr_in clientAddr{};
+    socklen_t addrLen = sizeof(clientAddr);
+
     if (gpioInitialise() < 0) {
         cerr << "[UART]pigpio initialization failed!" << endl;
         return 1;
     }
 
-    // UART初期化
-    int serialHandle = serOpen(const_cast<char*>("/dev/serial0"), baudRate, 0);
+    int serialHandle = serOpen((char*)"/dev/serial0", baudRate, 0);
     if (serialHandle < 0) {
         cerr << "[UART]Failed to open serial port!" << endl;
         gpioTerminate();
         return 1;
     }
+
+    cout << "[UDP]Listening on port " << ras_recv_port << endl;
     cout << "[UART] initialized at baud rate " << baudRate << endl;
 
-    fd_set readfds;
-    sockaddr_in clientAddr{};
-    socklen_t addrLen = sizeof(clientAddr);
+    int msgNum = 2;
     char buffer[16];
-
-    cout << "[UDP]Listening for UDP packets..." << endl;
 
     while (true) {
         FD_ZERO(&readfds);
         FD_SET(sock, &readfds);
-
-        // タイムアウトを短く（100ms）
         timeval timeout{};
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 100000;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
 
         int activity = select(sock + 1, &readfds, nullptr, nullptr, &timeout);
         if (activity < 0) {
@@ -94,33 +87,40 @@ int main() {
         }
 
         if (activity == 0) {
-            // タイムアウト（デフォルトコマンド送信）
-            char dami_buffer[msgNum] = { 'k', 0 };
+            // タイムアウト：定期送信
+            char dami_buffer[2] = { 'k', 0 };
             int result = serWrite(serialHandle, dami_buffer, msgNum);
             if (result < 0) {
                 cerr << "[UART]Failed to send data!" << endl;
             } else {
-                printf("Time Out! \ndami_buff[0]: %c , %u  dami_buff[1]: %c , %u\n",
+                printf("Time Out! \ndami_buff[0]: %c , %u  dami_buff[1]: %c , %u\n",
                        dami_buffer[0], dami_buffer[0], dami_buffer[1], dami_buffer[1]);
             }
             continue;
         }
 
         if (FD_ISSET(sock, &readfds)) {
-            // UDPパケットが溜まっている限り、受信し続ける
+            char latest_buffer[16] = {0};
+
+            // UDPバッファを空にして、最後に届いたデータだけ残す
             while (true) {
-                ssize_t len = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, (sockaddr*)&clientAddr, &addrLen);
+                ssize_t len = recvfrom(sock, buffer, sizeof(buffer) - 1, 0,
+                                       (sockaddr*)&clientAddr, &addrLen);
                 if (len <= 0) break;
-
                 buffer[len] = '\0';
-                cout << "[UDP]Received: " << buffer << endl;
+                strncpy(latest_buffer, buffer, sizeof(latest_buffer));
+            }
 
-                int result = serWrite(serialHandle, buffer, msgNum);
+            if (strlen(latest_buffer) > 0) {
+                cout << "[UDP]Latest Received: " << latest_buffer << endl;
+
+                int result = serWrite(serialHandle, latest_buffer, msgNum);
                 if (result < 0) {
                     cerr << "[UART]Failed to send data!" << endl;
                 } else {
-                    printf("uart送信数:%d\n buffer[0]: %c , %u  buffer[1]: %c , %u\n",
-                           msgNum, buffer[0], buffer[0], buffer[1], buffer[1]);
+                    printf("uart送信数:%d\n buffer[0]: %c , %u  buffer[1]: %c , %u\n",
+                           msgNum, latest_buffer[0], latest_buffer[0],
+                           latest_buffer[1], latest_buffer[1]);
                 }
             }
         }
@@ -132,8 +132,8 @@ int main() {
     return 0;
 }
 
-// カメラ送信用スレッド
-void thread_cv(int port, int WIDTH, int HEIGHT, int num, int ratio) {
+void thread_cv(int port, int WIDTH, int HEIGHT, int num, int ratio)
+{
     int sock;
     struct sockaddr_in addr;
     sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -147,7 +147,7 @@ void thread_cv(int port, int WIDTH, int HEIGHT, int num, int ratio) {
     cap.set(CAP_PROP_FPS, fps);
 
     if (!cap.isOpened()) {
-        cout << "Camera not Found\n!" << endl;
+        cout << "Camera not Found!\n";
         return;
     }
 
@@ -155,19 +155,20 @@ void thread_cv(int port, int WIDTH, int HEIGHT, int num, int ratio) {
     static const int sendSize = 65500;
     char buff[sendSize];
     vector<unsigned char> ibuff;
-    vector<int> param = {IMWRITE_JPEG_QUALITY, ratio};
+    vector<int> param = { IMWRITE_JPEG_QUALITY, ratio };
 
     while (waitKey(1) == -1) {
         cap >> frame;
         imencode(".jpg", frame, ibuff, param);
 
         if (ibuff.size() < sendSize) {
-            copy(ibuff.begin(), ibuff.end(), buff);
+            for (size_t i = 0; i < ibuff.size(); i++)
+                buff[i] = ibuff[i];
             sendto(sock, buff, sendSize, 0, (struct sockaddr*)&addr, sizeof(addr));
             jpgimg = imdecode(Mat(ibuff), IMREAD_COLOR);
         }
 
-        this_thread::sleep_for(chrono::milliseconds(1000 / fps));
+        sleep(1/fps);
     }
 
     close(sock);
