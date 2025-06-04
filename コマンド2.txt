@@ -1,0 +1,314 @@
+// コマンド例 (環境に合わせて調整してください)
+// g++ -Wall new_udp_uart_cv.cpp -std=c++11 `pkg-config --cflags --libs opencv4` -lpigpio -lpthread -g -o test_cv
+// sudo ./test_cv
+
+#include <iostream>
+#include <cstring>
+#include <csignal> // シグナルハンドリング用
+#include <cerrno>  // errno用
+#include <vector>
+#include <thread>
+#include <atomic> // スレッドセーフな終了フラグ用
+#include <chrono> // 時間制御用
+
+// UDP通信
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+
+// UART
+#include <pigpio.h>
+
+// OpenCV
+#include <opencv2/core.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/videoio.hpp>
+#include <opencv2/imgproc.hpp>
+
+using namespace std;
+using namespace cv;
+
+// --- グローバル設定 ---
+char pc_ip[] = "192.168.0.227";      // 通信先PCのIPアドレス
+int ras_recv_port = 9001;          // Raspberry PiがUDPデータを受信するポート
+int uart_baudRate = 9600;          // UARTのボーレート
+
+// カメラ設定
+int port_pc_cam1 = 8081;           // カメラ1の映像を送信するPC側ポート
+int cam1_device_num = 0;           // カメラ1のデバイス番号 (/dev/video0など)
+int cam1_width = 640;              // カメラ1の解像度 (幅)
+int cam1_height = 360;             // カメラ1の解像度 (高さ)
+int cam1_fps = 20;                 // カメラ1の目標FPS
+int cam1_jpeg_quality = 60;        // カメラ1のJPEG圧縮品質 (0-100)
+
+// (必要であればカメラ2の設定も同様に追加)
+// int port_pc_cam2 = 8082;
+// ...
+
+// プログラムを安全に終了するためのグローバルなフラグ
+std::atomic<bool> keep_running(true);
+
+void signal_handler(int signum) {
+    std::cout << "Interrupt signal (" << signum << ") received." << std::endl;
+    keep_running = false;
+}
+
+// --- カメラ送信スレッド関数 ---
+void thread_cv_transmit(const char* target_ip, int target_port, int cam_num, int width, int height, int target_fps, int jpeg_quality) {
+    std::cout << "[CAM_THREAD " << cam_num << "] Starting for " << target_ip << ":" << target_port 
+              << " (" << width << "x" << height << " @" << target_fps << "fps, Q:" << jpeg_quality << ")" << std::endl;
+
+    int sock_cam = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_cam < 0) {
+        std::cerr << "[CAM_THREAD " << cam_num << "] Socket creation failed: " << strerror(errno) << std::endl;
+        return;
+    }
+
+    sockaddr_in serverAddr_cam{};
+    serverAddr_cam.sin_family = AF_INET;
+    serverAddr_cam.sin_port = htons(target_port);
+    if (inet_pton(AF_INET, target_ip, &serverAddr_cam.sin_addr) <= 0) {
+        std::cerr << "[CAM_THREAD " << cam_num << "] inet_pton failed: " << strerror(errno) << std::endl;
+        close(sock_cam);
+        return;
+    }
+
+    VideoCapture cap(cam_num);
+    if (!cap.isOpened()) {
+        std::cerr << "[CAM_THREAD " << cam_num << "] Cannot open camera!" << std::endl;
+        close(sock_cam);
+        return;
+    }
+
+    cap.set(CAP_PROP_FRAME_WIDTH, width);
+    cap.set(CAP_PROP_FRAME_HEIGHT, height);
+    cap.set(CAP_PROP_FPS, target_fps); // 目標FPSを設定 (カメラが対応していれば)
+
+    Mat frame;
+    std::vector<unsigned char> jpeg_buffer;
+    std::vector<int> params = {IMWRITE_JPEG_QUALITY, jpeg_quality};
+
+    long long frame_interval_us = 1000000 / target_fps; // 1フレームあたりのマイクロ秒
+
+    while (keep_running) {
+        auto time_start_capture = std::chrono::steady_clock::now();
+
+        cap >> frame;
+        if (frame.empty()) {
+            std::cerr << "[CAM_THREAD " << cam_num << "] Captured empty frame." << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 少し待ってリトライ
+            continue;
+        }
+
+        if (!imencode(".jpg", frame, jpeg_buffer, params)) {
+            std::cerr << "[CAM_THREAD " << cam_num << "] imencode to JPEG failed." << std::endl;
+            continue;
+        }
+
+        if (jpeg_buffer.empty()) {
+            std::cerr << "[CAM_THREAD " << cam_num << "] JPEG buffer is empty after encoding." << std::endl;
+            continue;
+        }
+        
+        // std::cout << "[CAM_THREAD " << cam_num << "] JPEG size: " << jpeg_buffer.size() << " bytes" << std::endl;
+
+        ssize_t sent_bytes = sendto(sock_cam, jpeg_buffer.data(), jpeg_buffer.size(), 0,
+                                    (struct sockaddr*)&serverAddr_cam, sizeof(serverAddr_cam));
+
+        if (sent_bytes < 0) {
+            std::cerr << "[CAM_THREAD " << cam_num << "] sendto failed: " << strerror(errno) << std::endl;
+        } else if (static_cast<size_t>(sent_bytes) != jpeg_buffer.size()) {
+            std::cerr << "[CAM_THREAD " << cam_num << "] Sent partial data: " << sent_bytes << "/" << jpeg_buffer.size() << " bytes." << std::endl;
+        }
+
+        auto time_end_send = std::chrono::steady_clock::now();
+        long long processing_time_us = std::chrono::duration_cast<std::chrono::microseconds>(time_end_send - time_start_capture).count();
+        
+        if (processing_time_us < frame_interval_us) {
+            std::this_thread::sleep_for(std::chrono::microseconds(frame_interval_us - processing_time_us));
+        }
+    }
+
+    std::cout << "[CAM_THREAD " << cam_num << "] Stopping..." << std::endl;
+    cap.release();
+    close(sock_cam);
+    std::cout << "[CAM_THREAD " << cam_num << "] Stopped." << std::endl;
+}
+
+
+// --- メイン関数 ---
+int main() {
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    // --- カメラ送信スレッド起動 ---
+    std::thread th_cam1(thread_cv_transmit, pc_ip, port_pc_cam1, cam1_device_num, cam1_width, cam1_height, cam1_fps, cam1_jpeg_quality);
+    th_cam1.detach(); // メインスレッドから切り離して並行動作
+
+    // (必要であればカメラ2のスレッドも起動)
+    // std::thread th_cam2(thread_cv_transmit, pc_ip, port_pc_cam2, cam2_device_num, ...);
+    // th_cam2.detach();
+
+
+    // --- UDP受信 & UART送信 初期化 ---
+    int sock_udp_recv = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_udp_recv < 0) {
+        std::cerr << "[UDP_RECV] Socket creation failed: " << strerror(errno) << std::endl;
+        keep_running = false; // 他のスレッドも終了させる
+        // th_cam1.join(); // デタッチした場合、終了待ちのjoinは不要だが、安全のためには終了通知機構が必要
+        return -1;
+    }
+
+    sockaddr_in serverAddr_udp_recv{};
+    serverAddr_udp_recv.sin_family = AF_INET;
+    serverAddr_udp_recv.sin_addr.s_addr = INADDR_ANY;
+    serverAddr_udp_recv.sin_port = htons(ras_recv_port);
+
+    int reuse = 1;
+    if (setsockopt(sock_udp_recv, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse)) < 0) {
+        std::cerr << "[UDP_RECV] setsockopt(SO_REUSEADDR) failed: " << strerror(errno) << std::endl;
+    }
+    #ifdef SO_REUSEPORT
+    if (setsockopt(sock_udp_recv, SOL_SOCKET, SO_REUSEPORT, (const char*)&reuse, sizeof(reuse)) < 0) {
+        std::cerr << "[UDP_RECV] setsockopt(SO_REUSEPORT) failed: " << strerror(errno) << std::endl;
+    }
+    #endif
+
+    if (bind(sock_udp_recv, (sockaddr*)&serverAddr_udp_recv, sizeof(serverAddr_udp_recv)) < 0) {
+        std::cerr << "[UDP_RECV] Bind failed: " << strerror(errno) << std::endl;
+        close(sock_udp_recv);
+        keep_running = false;
+        return -1;
+    }
+
+    int flags = fcntl(sock_udp_recv, F_GETFL, 0);
+    if (flags == -1 || fcntl(sock_udp_recv, F_SETFL, flags | O_NONBLOCK) == -1) {
+        std::cerr << "[UDP_RECV] fcntl set O_NONBLOCK failed: " << strerror(errno) << std::endl;
+        close(sock_udp_recv);
+        keep_running = false;
+        return -1;
+    }
+
+    std::cout << "[UDP_RECV] Listening for UDP packets on port " << ras_recv_port << "..." << std::endl;
+
+    if (gpioInitialise() < 0) {
+        std::cerr << "[UART] pigpio initialization failed!" << std::endl;
+        close(sock_udp_recv);
+        keep_running = false;
+        return 1;
+    }
+
+    int serialHandle = serOpen(const_cast<char*>("/dev/serial0"), uart_baudRate, 0);
+    if (serialHandle < 0) {
+        std::cerr << "[UART] Failed to open serial port! Error code: " << serialHandle << std::endl;
+        gpioTerminate();
+        close(sock_udp_recv);
+        keep_running = false;
+        return 1;
+    }
+    std::cout << "[UART] initialized at baud rate " << uart_baudRate << std::endl;
+
+    int uart_send_target_length = 2; // UARTへ送信する目標バイト数
+    char udp_recv_buffer[16];      // UDP受信用バッファ
+
+    // --- メインループ (UDP受信 & UART送信) ---
+    while (keep_running) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(sock_udp_recv, &readfds);
+        timeval timeout{};
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+
+        int activity = select(sock_udp_recv + 1, &readfds, nullptr, nullptr, &timeout);
+
+        if (activity < 0) {
+            if (errno == EINTR && !keep_running) {
+                std::cout << "[UDP_RECV_LOOP] select interrupted by signal, exiting." << std::endl;
+                break;
+            }
+            std::cerr << "[UDP_RECV_LOOP] select error: " << strerror(errno) << std::endl;
+            break;
+        }
+
+        if (activity == 0) { // Timeout
+            char dami_buffer[uart_send_target_length];
+            dami_buffer[0] = 'k';
+            if (uart_send_target_length > 1) dami_buffer[1] = 0;
+            
+            int res = serWrite(serialHandle, dami_buffer, uart_send_target_length);
+            if (res < 0) {
+                 // std::cerr << "[UART] Failed to send dummy data! Error: " << res << std::endl;
+            } else {
+                 // printf("Time Out! Sent dummy: %c, %c\n", dami_buffer[0], dami_buffer[1]);
+            }
+            continue;
+        }
+
+        if (FD_ISSET(sock_udp_recv, &readfds)) {
+            ssize_t len;
+            sockaddr_in clientAddr_udp_recv{};
+            socklen_t addrLen_udp_recv = sizeof(clientAddr_udp_recv);
+
+            while (true) {
+                len = recvfrom(sock_udp_recv, udp_recv_buffer, sizeof(udp_recv_buffer) - 1, 0,
+                               (sockaddr*)&clientAddr_udp_recv, &addrLen_udp_recv);
+                if (len > 0) {
+                    udp_recv_buffer[len] = '\0';
+                    // std::cout << "[UDP_RECV] Received " << len << " bytes: \"" << udp_recv_buffer << "\"" << std::endl;
+
+                    int bytes_to_send_uart = (len < uart_send_target_length) ? len : uart_send_target_length;
+                    
+                    int res = serWrite(serialHandle, udp_recv_buffer, bytes_to_send_uart);
+                    if (res < 0) {
+                        std::cerr << "[UART] Failed to send data! Error code: " << res << std::endl;
+                    } else {
+                        if (bytes_to_send_uart >= 2) {
+                             printf("uart送信数:%d\n buffer[0]: %c , %u  buffer[1]: %c , %u\n", bytes_to_send_uart, udp_recv_buffer[0], (unsigned char)udp_recv_buffer[0], udp_recv_buffer[1], (unsigned char)udp_recv_buffer[1]);
+                        } else if (bytes_to_send_uart == 1) {
+                             printf("uart送信数:%d\n buffer[0]: %c , %u\n", bytes_to_send_uart, udp_recv_buffer[0], (unsigned char)udp_recv_buffer[0]);
+                        } else {
+                             printf("uart送信数:%d\n", bytes_to_send_uart);
+                        }
+                    }
+                } else if (len == 0) {
+                    break;
+                } else { // len < 0
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        break; // No more data
+                    } else if (errno == EINTR && !keep_running) {
+                        std::cout << "[UDP_RECV_LOOP] recvfrom interrupted by signal, exiting." << std::endl;
+                        goto cleanup_and_exit_main_loop;
+                    } else {
+                        std::cerr << "[UDP_RECV_LOOP] recvfrom failed: " << strerror(errno) << std::endl;
+                        goto cleanup_and_exit_main_loop;
+                    }
+                }
+            }
+        }
+    }
+
+cleanup_and_exit_main_loop:; // Label for goto from inner loops if needed
+
+    std::cout << "[MAIN] Cleaning up and exiting..." << std::endl;
+    keep_running = false; // Ensure other threads know to exit
+
+    // カメラ用スレッドがデタッチされているので、メイン終了時に自動的に終了するわけではない。
+    // keep_runningフラグを見て自律的に終了するのを待つか、
+    // より確実にはjoinableなスレッドにしてここでjoinする（ただしデタッチと矛盾）。
+    // 今回はkeep_runningに依存し、少し待つことでスレッドが終了処理を行う時間を与える。
+    std::this_thread::sleep_for(std::chrono::milliseconds(500)); // カメラ スレッドに終了する時間を与える
+
+    if (serialHandle >= 0) serClose(serialHandle);
+    gpioTerminate();
+    std::cout << "[UART] Resources released." << std::endl;
+
+    if (sock_udp_recv >= 0) close(sock_udp_recv);
+    std::cout << "[UDP_RECV] Socket closed." << std::endl;
+
+    std::cout << "[MAIN] Program finished." << std::endl;
+    return 0;
+}
