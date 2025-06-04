@@ -1,0 +1,251 @@
+// コマンド
+// g++ -Wall new_udp_uart.cpp -std=c++11 -lopencv_core -lopencv_highgui -lopencv_imgcodecs -lopencv_videoio -lopencv_imgproc -lpigpio -lpthread -g -O0 -o test
+// g++ -Wall new_udp_uart.cpp -std=c++11 -I/usr/local/include/opencv4 -L/usr/local/lib -lopencv_core -lopencv_highgui -lopencv_imgcodecs -lopencv_videoio -lopencv_imgproc -lpigpio -lpthread -g -O0 -o test
+// sudo ./test
+//
+//-------------------------------------------------------------------------
+
+// UDP通信
+#include <iostream>
+#include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <csignal> // シグナルハンドリング用
+#include <cerrno>  // errno用
+
+// UART
+#include <pigpio.h>
+
+// cv (現在はメインでは未使用ですが、カメラ用スレッドのために残します)
+#include <opencv2/core.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/videoio.hpp>
+#include <opencv2/imgproc.hpp>
+
+// その他
+#include <vector>
+#include <thread>
+#include <atomic> // スレッドセーフな終了フラグ用
+
+using namespace std;
+using namespace cv;
+
+char pc_ip[] = "192.168.0.227";       // 通信先PC
+int ras_recv_port = 9001;
+// int port_pc_cam1 = 8081;           // サブカメラ1 (未使用)
+// int port_pc_cam2 = 8082;           // サブカメラ2 (未使用)
+int baudRate = 9600; // BPS
+// int fps = 20; // (カメラ用スレッドで使う場合は必要)
+
+//カメラ送信スレッド (現在はコメントアウト)
+// void thread_cv(int port, int WIDTH, int HEIGHT, int num, int ratio);
+
+// プログラムを安全に終了するためのグローバルなフラグ
+std::atomic<bool> keep_running(true);
+
+void signal_handler(int signum) {
+    std::cout << "Interrupt signal (" << signum << ") received." << std::endl;
+    keep_running = false;
+}
+
+int main() {
+    // Ctrl+C (SIGINT) や kill (SIGTERM) シグナルを捕捉
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    // ソケット生成
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        std::cerr << "[UDP]Socket creation failed: " << strerror(errno) << std::endl;
+        return -1;
+    }
+
+    // ソケットアドレスの設定
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY; // すべてのIPアドレスで受信
+    serverAddr.sin_port = htons(ras_recv_port);      // ポート番号
+
+    // アドレス再利用オプションを設定 (推奨)
+    int reuse = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse)) < 0) {
+        std::cerr << "[UDP]setsockopt(SO_REUSEADDR) failed: " << strerror(errno) << std::endl;
+    }
+    #ifdef SO_REUSEPORT // 環境によってはSO_REUSEPORTも利用可能
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (const char*)&reuse, sizeof(reuse)) < 0) {
+        std::cerr << "[UDP]setsockopt(SO_REUSEPORT) failed: " << strerror(errno) << std::endl;
+    }
+    #endif
+
+    // ソケットのバインド
+    if (bind(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        std::cerr << "[UDP]Bind failed: " << strerror(errno) << std::endl;
+        close(sock);
+        return -1;
+    }
+
+    // 非ブロッキングモードに設定
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags == -1) {
+        std::cerr << "[UDP]fcntl(F_GETFL) failed: " << strerror(errno) << std::endl;
+        close(sock);
+        return -1;
+    }
+    if (fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1) {
+        std::cerr << "[UDP]fcntl(F_SETFL O_NONBLOCK) failed: " << strerror(errno) << std::endl;
+        close(sock);
+        return -1;
+    }
+
+    fd_set readfds;
+    sockaddr_in clientAddr{};
+    socklen_t addrLen = sizeof(clientAddr);
+
+    std::cout << "[UDP]Listening for UDP packets on port " << ras_recv_port << "..." << std::endl;
+
+    // pigpioの初期化
+    if (gpioInitialise() < 0) {
+        std::cerr << "[UART]pigpio initialization failed!" << std::endl;
+        close(sock);
+        return 1;
+    }
+
+    // シリアルポートの設定
+    int serialHandle = serOpen(const_cast<char*>("/dev/serial0"), baudRate, 0);
+    if (serialHandle < 0) {
+        std::cerr << "[UART]Failed to open serial port! Error code: " << serialHandle << std::endl;
+        gpioTerminate();
+        close(sock);
+        return 1;
+    }
+    std::cout << "[UART] initialized at baud rate " << baudRate << std::endl;
+
+    // UARTへ送信するバイト数 (固定長の場合。受信データ長に合わせる場合は変更)
+    int uart_send_length = 2;
+    
+    char udp_buffer[16]; // UDP受信用バッファ (最大15バイトのデータ + null終端文字)
+
+    while (keep_running) {
+        FD_ZERO(&readfds);
+        FD_SET(sock, &readfds);
+        timeval timeout{};
+        timeout.tv_sec = 1;  // タイムアウト1秒
+        timeout.tv_usec = 0;
+
+        int activity = select(sock + 1, &readfds, nullptr, nullptr, &timeout);
+
+        if (activity < 0) {
+            if (errno == EINTR && !keep_running) { // シグナルによる中断
+                std::cout << "[select] Interrupted by signal, exiting." << std::endl;
+                break;
+            }
+            std::cerr << "[select] error: " << strerror(errno) << std::endl;
+            break; 
+        }
+
+        if (activity == 0) { // タイムアウト
+            // std::cout << "Waiting for data..." << std::endl; // デバッグ用
+            char dami_buffer[uart_send_length]; // UART送信バイト数に合わせる
+            dami_buffer[0] = 'k';
+            if (uart_send_length > 1) {
+                 dami_buffer[1] = 0; 
+            }
+            // 必要に応じて残りの dami_buffer も初期化
+
+            int result = serWrite(serialHandle, dami_buffer, uart_send_length);
+            if (result < 0) {
+                // pigpio の serWrite は成功すれば送信バイト数を、失敗すればエラーコード(<0)を返す
+                std::cerr << "[UART]Failed to send dummy data! Error code: " << result << std::endl;
+            } else {
+                // printf("Time Out! Sent dummy: ");
+                // for(int i=0; i<uart_send_length; ++i) printf("%c(0x%02X) ", dami_buffer[i], (unsigned char)dami_buffer[i]);
+                // printf("\n");
+            }
+            continue;
+        }
+
+        if (FD_ISSET(sock, &readfds)) {
+            ssize_t len;
+            // ソケットバッファにデータがある限り読み出す
+            while (true) { 
+                len = recvfrom(sock, udp_buffer, sizeof(udp_buffer) - 1, 0, (sockaddr*)&clientAddr, &addrLen);
+                if (len > 0) {
+                    udp_buffer[len] = '\0'; // 文字列として表示する場合のためにNULL終端
+                    // std::cout << "[UDP]Received " << len << " bytes: \"" << udp_buffer << "\"" << std::endl;
+
+                    // UARTに送信する実際のバイト数を決定
+                    // 例: 受信したデータ長(len)と固定長(uart_send_length)の小さい方、または受信したそのままの長さ len
+                    int bytes_to_send_uart = (len < uart_send_length) ? len : uart_send_length;
+                    // もし受信したデータを全て送りたい場合は:
+                    // int bytes_to_send_uart = len;
+                    // ただし、この場合 uart_send_length の変数の意味合いが変わるか、不要になる
+
+                    int result = serWrite(serialHandle, udp_buffer, bytes_to_send_uart);
+                    if (result < 0) {
+                        std::cerr << "[UART]Failed to send data! Error code: " << result << std::endl;
+                    } else {
+                        // printf("[UART]Sent %d bytes. ", bytes_to_send_uart);
+                        // if (bytes_to_send_uart > 0) printf("udp_buffer[0]: %c (0x%02X) ", udp_buffer[0], (unsigned char)udp_buffer[0]);
+                        // if (bytes_to_send_uart > 1) printf("udp_buffer[1]: %c (0x%02X) ", udp_buffer[1], (unsigned char)udp_buffer[1]);
+                        // printf("\n");
+                        // ユーザーの元のprintfに合わせる
+                        if (bytes_to_send_uart >= 2) { // 少なくとも2バイト送信した場合のみ両方表示
+                             printf("uart送信数:%d\n buffer[0]: %c , %u  buffer[1]: %c , %u\n", bytes_to_send_uart, udp_buffer[0], (unsigned char)udp_buffer[0], udp_buffer[1], (unsigned char)udp_buffer[1]);
+                        } else if (bytes_to_send_uart == 1) {
+                             printf("uart送信数:%d\n buffer[0]: %c , %u\n", bytes_to_send_uart, udp_buffer[0], (unsigned char)udp_buffer[0]);
+                        } else {
+                             printf("uart送信数:%d\n", bytes_to_send_uart);
+                        }
+                    }
+                } else if (len == 0) {
+                    // UDPでは通常発生しないが念のため
+                    std::cout << "[UDP]recvfrom returned 0." << std::endl;
+                    break; 
+                } else { // len < 0
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        // これ以上読み込むデータがない
+                        break; 
+                    } else if (errno == EINTR && !keep_running) { // シグナルによる中断
+                        std::cout << "[recvfrom] Interrupted by signal, exiting." << std::endl;
+                        goto cleanup_and_exit; // gotoでクリーンアップ処理へ
+                    } else {
+                        std::cerr << "[UDP]recvfrom failed: " << strerror(errno) << std::endl;
+                        goto cleanup_and_exit; // 致命的なエラーとして終了処理へ
+                    }
+                }
+            } // recvfromの内部ループ終了
+        }
+    } // keep_running ループ終了
+
+cleanup_and_exit: // リソース解放処理
+    std::cout << "Cleaning up and exiting..." << std::endl;
+
+    if (serialHandle >= 0) {
+        serClose(serialHandle);
+        std::cout << "[UART]Serial port closed." << std::endl;
+    }
+    gpioTerminate();
+    std::cout << "[UART]pigpio terminated." << std::endl;
+
+    if (sock >= 0) {
+        close(sock);
+        std::cout << "[UDP]Socket closed." << std::endl;
+    }
+    return 0;
+}
+
+/*
+// カメラ送信スレッドの修正案 (もし使用する場合)
+// void thread_cv(int port, int WIDTH, int HEIGHT, int num, int ratio) {
+//     // ... (元のコードをベースに、エラーハンドリング、リソース解放、
+//     //      keep_running フラグによる安全な終了処理を追加)
+//     // sendtoの第三引数は ibuff.size() にするべきです。
+//     // sleep(1/fps) は整数除算になるため usleep(1000000 / fps) などを使用。
+//     // waitKey(1) == -1 のループ条件は、カメラが有効である限り続けるか、
+//     // keep_running フラグで制御する方が良いでしょう。
+// }
+*/
