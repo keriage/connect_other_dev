@@ -1,0 +1,183 @@
+
+#include <iostream>
+#include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+
+#include <pigpio.h>
+
+#include <opencv2/core.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/videoio.hpp>
+#include <opencv2/imgproc.hpp>
+
+#include <vector>
+#include <thread>
+
+using namespace std;
+using namespace cv;
+
+char pc_ip[] = "192.168.23.5";          // 通信先PC
+int ras_recv_port = 9001;
+int port_pc_cam1 = 8081;                 // サブカメラ1
+int port_pc_cam2 = 8082;                 // サブカメラ2
+int baudRate = 9600;                     // BPS
+int fps = 20;                            // フレームレート
+
+void thread_cv(int port, int WIDTH, int HEIGHT, int num, int ratio);
+
+int main() {
+
+        //カメラ用スレッド開始
+    //thread th1(thread_cv, port_pc_cam1, 640, 360, 0, 60);
+    thread th1(thread_cv, port_pc_cam1, 1920/3, 1080/3, 0, 50);
+    th1.detach();
+
+
+    // UDPソケット作成
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        cerr << "[UDP]Socket creation failed" << endl;
+        return -1;
+    }
+
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(ras_recv_port);
+
+    if (bind(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        cerr << "[UDP]Bind failed" << endl;
+        close(sock);
+        return -1;
+    }
+
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);  // 非ブロッキング
+
+    fd_set readfds;
+    sockaddr_in clientAddr{};
+    socklen_t addrLen = sizeof(clientAddr);
+
+    if (gpioInitialise() < 0) {
+        cerr << "[UART]pigpio initialization failed!" << endl;
+        return 1;
+    }
+
+    int serialHandle = serOpen((char*)"/dev/serial0", baudRate, 0);
+    if (serialHandle < 0) {
+        cerr << "[UART]Failed to open serial port!" << endl;
+        gpioTerminate();
+        return 1;
+    }
+
+    cout << "[UDP]Listening on port " << ras_recv_port << endl;
+    cout << "[UART] initialized at baud rate " << baudRate << endl;
+
+    int msgNum = 2;
+    char buffer[16];
+
+    while (true) {
+        FD_ZERO(&readfds);
+        FD_SET(sock, &readfds);
+        timeval timeout{};
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 100000;
+
+        int activity = select(sock + 1, &readfds, nullptr, nullptr, &timeout);
+        if (activity < 0) {
+            cerr << "select() error" << endl;
+            break;
+        }
+
+        if (activity == 0) {
+            // タイムアウト：定期送信
+            char dami_buffer[2] = { 'k', 0 };
+            int result = serWrite(serialHandle, dami_buffer, msgNum);
+            if (result < 0) {
+                cerr << "[UART]Failed to send data!" << endl;
+            } else {
+                printf("Time Out! \ndami_buff[0]: %c , %u  dami_buff[1]: %c , %u\n",
+                       dami_buffer[0], dami_buffer[0], dami_buffer[1], dami_buffer[1]);
+            }
+            continue;
+        }
+
+        if (FD_ISSET(sock, &readfds)) {
+            char latest_buffer[16] = {0};
+
+            // UDPバッファを空にして、最後に届いたデータだけ残す
+            while (true) {
+                ssize_t len = recvfrom(sock, buffer, sizeof(buffer) - 1, 0,
+                                       (sockaddr*)&clientAddr, &addrLen);
+                if (len <= 0) break;
+                buffer[len] = '\0';
+                strncpy(latest_buffer, buffer, sizeof(latest_buffer));
+            }
+
+            if (strlen(latest_buffer) > 0) {
+                cout << "[UDP]Latest Received: " << latest_buffer << endl;
+
+                int result = serWrite(serialHandle, latest_buffer, msgNum);
+                if (result < 0) {
+                    cerr << "[UART]Failed to send data!" << endl;
+                } else {
+                    printf("uart送信数:%d\n buffer[0]: %c , %u  buffer[1]: %c , %u\n",
+                           msgNum, latest_buffer[0], latest_buffer[0],
+                           latest_buffer[1], latest_buffer[1]);
+                }
+            }
+        }
+    }
+
+    serClose(serialHandle);
+    gpioTerminate();
+    close(sock);
+    return 0;
+}
+
+void thread_cv(int port, int WIDTH, int HEIGHT, int num, int ratio)
+{
+    int sock;
+    struct sockaddr_in addr;
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = inet_addr(pc_ip);
+
+    VideoCapture cap(num);
+    cap.set(CAP_PROP_FRAME_WIDTH, WIDTH);
+    cap.set(CAP_PROP_FRAME_HEIGHT, HEIGHT);
+    cap.set(CAP_PROP_FPS, fps);
+
+    if (!cap.isOpened()) {
+        cout << "Camera not Found!\n";
+        return;
+    }
+
+    Mat frame, jpgimg;
+    static const int sendSize = 65500;
+    char buff[sendSize];
+    vector<unsigned char> ibuff;
+    vector<int> param = { IMWRITE_JPEG_QUALITY, ratio };
+
+    while (waitKey(1) == -1) {
+        cap >> frame;
+        imencode(".jpg", frame, ibuff, param);
+
+        if (ibuff.size() < sendSize) {
+            for (size_t i = 0; i < ibuff.size(); i++)
+                buff[i] = ibuff[i];
+            sendto(sock, buff, sendSize, 0, (struct sockaddr*)&addr, sizeof(addr));
+            jpgimg = imdecode(Mat(ibuff), IMREAD_COLOR);
+        }
+
+        sleep(1/fps);
+    }
+
+    close(sock);
+}

@@ -1,8 +1,8 @@
 // コマンド
-// g++ -Wall new_udp_uart.cpp -std=c++11 -lopencv_core -lopencv_highgui -lopencv_imgcodecs -lopencv_videoio -lopencv_imgproc -lpigpio -lpthread -g -O0 -o test
 // g++ -Wall new_udp_uart.cpp -std=c++11 -I/usr/local/include/opencv4 -L/usr/local/lib -lopencv_core -lopencv_highgui -lopencv_imgcodecs -lopencv_videoio -lopencv_imgproc -lpigpio -lpthread -g -O0 -o test
 // sudo ./test
-//
+// opencvのファイルlocalに入っていますので注意してください
+// シリアルの初期化でエラーが出たばあい、sudo nano /etc/rc.localのファイルで、オートスタートを有効にしているかもしれません。確認してください。
 //-------------------------------------------------------------------------
 
 // UDP通信
@@ -32,7 +32,7 @@
 using namespace std;
 using namespace cv;
 
-char pc_ip[] = "192.168.0.227";          //通信先PC
+char pc_ip[] = "192.168.23.5";          //通信先PC
 int ras_recv_port = 9001;
 int port_pc_cam1 = 8081;                //サブカメラ1
 int port_pc_cam2 = 8082;                //サブカメラ2
@@ -49,7 +49,8 @@ int main() {
 
     //カメラ用スレッド開始
     //thread th1(thread_cv, port_pc_cam1, 640, 360, 0, 60);
-    //th1.detach();
+    thread th1(thread_cv, port_pc_cam1, 1920/3, 1080/3, 0, 50);
+    th1.detach();
 
     // ソケット生成
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -72,8 +73,8 @@ int main() {
     }
 
     // 非ブロッキングモードに設定
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+     int flags = fcntl(sock, F_GETFL, 0);
+     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
     fd_set readfds;
     sockaddr_in clientAddr{};
@@ -103,6 +104,7 @@ int main() {
     
     //udp受信のメモリ設定
     char buffer[16];
+    char buffer_copy[3];
 
     while (true) {
 
@@ -110,7 +112,7 @@ int main() {
         FD_ZERO(&readfds);
         FD_SET(sock, &readfds);
         timeval timeout{};
-        timeout.tv_sec = 1;
+        timeout.tv_sec = 2;
         timeout.tv_usec = 0;
 
         // ソケットの監視
@@ -126,9 +128,7 @@ int main() {
             std::cout << "Waiting for data..." << std::endl;
 
             // データ送信
-            char dami_buffer[msgNum];
-            dami_buffer[0] = 'k';
-            dami_buffer[1] = 0;
+            char dami_buffer[msgNum] = {'k', 0};
             int result = serWrite(serialHandle, dami_buffer, msgNum);
 
             //データ送信確認
@@ -147,11 +147,24 @@ int main() {
             ssize_t len = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, (sockaddr*)&clientAddr, &addrLen);
             if (len > 0) {
 
-                buffer[len] = '\0'; // 文字列の終端を追加
+                buffer[2] = '\0'; // 文字列の終端を追加
                 std::cout << "[UDP]Received: " << buffer << std::endl;
 
+/*
+                if(strlen(buffer) >= 2){
+                    buffer_copy[0] = buffer[0];
+                    buffer_copy[1] = buffer[1];
+                    buffer_copy[2] = '\0';
+                }else{
+                    buffer_copy[0] = 'k';
+                    buffer_copy[1] = 0;
+                    buffer_copy[2] = '\0';
+                }
+*/
                 // データ送信
                 int result = serWrite(serialHandle, buffer, msgNum);
+                //int result = serWrite(serialHandle, buffer_copy, msgNum);
+
                 if (result < 0) {
                     std::cerr << "[UART]Failed to send data!" << std::endl;
                 } else {     
@@ -159,12 +172,14 @@ int main() {
                 }
             }
 
+            usleep(10000);
+
         }
     }
 
     // UARTの終了
-    serClose(serialHandle); // UARTポートのクローズ
-    gpioTerminate(); // pigpioの終了
+    // serClose(serialHandle); // UARTポートのクローズ
+    // gpioTerminate(); // pigpioの終了
 
     // UDPの終了
     close(sock);
@@ -204,18 +219,17 @@ void thread_cv(int port, int WIDTH, int HEIGHT, int num, int ratio)
     param[0] = IMWRITE_JPEG_QUALITY;        //jpg使用
     param[1] = ratio;                       //圧縮率
 
-
     //メイン部分
-    while (waitKey(1) == -1)
+    while (1)
     {
         cap >> frame;
 
-        imencode(".jpg", frame, ibuff, param);
-
         //最大パケット数を越えるとUDPできない
         //複数カメラを使うときは ibuff.size() の合計が65500を越えないように圧縮率で調整する。
-        if (ibuff.size() < sendSize)
+        if (!frame.empty())
         {
+            imencode(".jpg", frame, ibuff, param);
+
             for (std::vector<unsigned char>::size_type i = 0; i < ibuff.size(); i++)
                 buff[i] = ibuff[i];
             sendto(sock, buff, sendSize, 0, (struct sockaddr*)&addr, sizeof(addr));
@@ -223,11 +237,9 @@ void thread_cv(int port, int WIDTH, int HEIGHT, int num, int ratio)
 
         }
 
-        //cout << ibuff.size() <<"_"<< num<< "\n";
+        // cout << "camera size" << ibuff.size() << "\n";
 
-        //fpsに合わせてる？
-        sleep(1/fps);
-
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000 / fps));
     }
     close(sock);
 }
