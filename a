@@ -1,43 +1,56 @@
 #include <iostream>
 #include <cstring>
+#include <vector>
+#include <thread>
+#include <chrono>
+
+// --- 通信関連 ---
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <arpa/inet.h>
+#include <unistd.h> // write, read, close, usleep
+#include <fcntl.h>  // fcntl, O_RDWR, O_NOCTTY, O_NONBLOCK
 
-#include <pigpio.h>
+// --- シリアル通信関連 (termios) ---
+#include <termios.h>
 
+// --- OpenCV関連 ---
 #include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include <vector>
-#include <thread>
-#include <chrono> // std::chrono を使うために追加
-
 using namespace std;
 using namespace cv;
 
-// グローバル定数として定義
+// --- 設定 ---
 const char PC_IP[] = "192.168.23.5";
 const int RAS_RECV_PORT = 9001;
 const int PORT_PC_CAM1 = 8081;
-const int PORT_PC_CAM2 = 8082;
-const int BAUD_RATE = 9600;
+const int BAUD_RATE = B9600; // termios.hで定義されている定数を使用
 const int FPS = 20;
 
+// --- プロトタイプ宣言 ---
 void thread_cv(int port, int width, int height, int device_num, int quality_ratio);
+int setup_serial_port(const char* port_name, speed_t baud_rate);
 
+// =================================================================
+//  メインスレッド: UDP受信 と UART送信 に特化
+// =================================================================
 int main() {
-    // カメラ用スレッド開始
-    // thread th1(thread_cv, PORT_PC_CAM1, 640, 360, 0, 60);
-    thread th1(thread_cv, PORT_PC_CAM1, 1920/3, 1080/3, 0, 50);
+    // --- カメラ用スレッドを開始 ---
+    thread th1(thread_cv, PORT_PC_CAM1, 1920 / 3, 1080 / 3, 0, 50);
     th1.detach();
 
-    // UDPソケット作成
+    // --- UARTポートをセットアップ ---
+    int serial_fd = setup_serial_port("/dev/serial0", BAUD_RATE);
+    if (serial_fd < 0) {
+        return 1;
+    }
+    cout << "[UART] Serial port opened successfully." << endl;
+
+    // --- UDPソケットをセットアップ ---
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         cerr << "[UDP] Socket creation failed" << endl;
@@ -56,85 +69,42 @@ int main() {
     }
 
     // ソケットを非ブロッキングモードに設定
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-
-    if (gpioInitialise() < 0) {
-        cerr << "[UART] pigpio initialization failed!" << endl;
-        return 1;
-    }
-
-    int serialHandle = serOpen((char*)"/dev/serial0", BAUD_RATE, 0);
-    if (serialHandle < 0) {
-        cerr << "[UART] Failed to open serial port!" << endl;
-        gpioTerminate();
-        return 1;
-    }
+    fcntl(sock, F_SETFL, O_NONBLOCK);
 
     cout << "[UDP] Listening on port " << RAS_RECV_PORT << endl;
-    cout << "[UART] initialized at baud rate " << BAUD_RATE << endl;
 
+    // --- メインループ ---
+    char buffer[16];
     const int MSG_NUM = 2;
 
     while (true) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(sock, &readfds);
+        // UDPソケットからデータをノンブロッキングで受信試行
+        ssize_t len = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, nullptr, nullptr);
+
+        if (len > 0) {
+            // データを受信した場合、UARTに送信
+            buffer[len] = '\0';
+            cout << "[UDP] Received: " << buffer << endl;
+            
+            // UARTポートに書き込む
+            ssize_t written = write(serial_fd, buffer, MSG_NUM);
+            if (written < 0) {
+                cerr << "[UART] Failed to write to serial port!" << endl;
+            }
+        }
         
-        timeval timeout{};
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 100000; // 100ms
-
-        int activity = select(sock + 1, &readfds, nullptr, nullptr, &timeout);
-        if (activity < 0) {
-            cerr << "select() error" << endl;
-            break;
-        }
-
-        // タイムアウトした場合: 定期データをシリアル送信
-        if (activity == 0) {
-            char dami_buffer[2] = { 'k', 0 };
-            if (serWrite(serialHandle, dami_buffer, MSG_NUM) < 0) {
-                cerr << "[UART] Failed to send periodic data!" << endl;
-            }
-            continue;
-        }
-
-        // UDPデータを受信した場合
-        if (FD_ISSET(sock, &readfds)) {
-            char buffer[16];
-            char latest_buffer[16] = {0};
-            sockaddr_in clientAddr{};
-            socklen_t addrLen = sizeof(clientAddr);
-            ssize_t len;
-
-            // ★修正点: バッファに溜まったデータを全て読み出し、最後のデータだけを処理する
-            // データがなくなるまでrecvfromを呼び出す (データがない場合、-1が返りループが終了する)
-            while ((len = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, (sockaddr*)&clientAddr, &addrLen)) > 0) {
-                buffer[len] = '\0';
-                strncpy(latest_buffer, buffer, sizeof(latest_buffer) - 1);
-            }
-
-            if (strlen(latest_buffer) > 0) {
-                cout << "[UDP] Latest Received: " << latest_buffer << endl;
-
-                if (serWrite(serialHandle, latest_buffer, MSG_NUM) < 0) {
-                    cerr << "[UART] Failed to send data!" << endl;
-                } else {
-                    printf("uart送信数:%d\n buffer[0]: %c , %u  buffer[1]: %c , %u\n",
-                           MSG_NUM, latest_buffer[0], (unsigned char)latest_buffer[0],
-                           latest_buffer[1], (unsigned char)latest_buffer[1]);
-                }
-            }
-        }
+        // CPUを100%消費しないように、非常に短い待機を入れる
+        usleep(1000); // 1ms待機
     }
 
-    serClose(serialHandle);
-    gpioTerminate();
+    close(serial_fd);
     close(sock);
     return 0;
 }
 
+// =================================================================
+//  カメラ処理スレッド: 変更なし
+// =================================================================
 void thread_cv(int port, int width, int height, int device_num, int quality_ratio) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
@@ -153,40 +123,88 @@ void thread_cv(int port, int width, int height, int device_num, int quality_rati
     cap.set(CAP_PROP_FPS, FPS);
 
     if (!cap.isOpened()) {
-        cout << "Camera not Found! Device: " << device_num << "\n";
+        cout << "[CAM_THREAD] Camera not found! Device: " << device_num << endl;
         return;
     }
 
     Mat frame;
     vector<unsigned char> ibuff;
     vector<int> param = { IMWRITE_JPEG_QUALITY, quality_ratio };
-    
-    // ★修正点: ループ条件を `while(true)` に変更。waitKeyは不要。
+
     while (true) {
         cap >> frame;
         if (frame.empty()) {
             cerr << "[CAM_THREAD] Failed to capture frame" << endl;
-            // 待機してからリトライ
-            std::this_thread::sleep_for(std::chrono::milliseconds(500)); 
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
         }
 
         imencode(".jpg", frame, ibuff, param);
 
-        // ★修正点: 実際のJPEGデータサイズで送信し、不要なデータコピーをやめる
-        // ibuff.data()でvectorの生ポインタを取得できる
         if (!ibuff.empty()) {
-             sendto(sock, ibuff.data(), ibuff.size(), 0, (struct sockaddr*)&addr, sizeof(addr));
+            sendto(sock, ibuff.data(), ibuff.size(), 0, (struct sockaddr*)&addr, sizeof(addr));
         }
-        
-        // ★修正点: 不要なデコード処理を削除
-        // jpgimg = imdecode(Mat(ibuff), IMREAD_COLOR);
 
-        // ★修正点: CPUを過剰に消費しないよう、フレームレートに合わせて正確に待機する
-        // sleep(1/fps); は機能しないため、`std::this_thread::sleep_for` を使用する
         std::this_thread::sleep_for(std::chrono::milliseconds(1000 / FPS));
     }
-
     close(sock);
-    // capはデストラクタで自動的に解放される
+}
+
+
+// =================================================================
+//  標準APIによるシリアルポート設定関数
+// =================================================================
+int setup_serial_port(const char* port_name, speed_t baud_rate) {
+    int fd = open(port_name, O_RDWR | O_NOCTTY);
+    if (fd < 0) {
+        cerr << "[UART] Error opening " << port_name << ": " << strerror(errno) << endl;
+        return -1;
+    }
+
+    termios tty{};
+    if (tcgetattr(fd, &tty) != 0) {
+        cerr << "[UART] Error from tcgetattr: " << strerror(errno) << endl;
+        close(fd);
+        return -1;
+    }
+
+    // ボーレート設定
+    cfsetospeed(&tty, baud_rate);
+    cfsetispeed(&tty, baud_rate);
+
+    // 制御フラグ設定
+    tty.c_cflag &= ~PARENB;  // パリティなし
+    tty.c_cflag &= ~CSTOPB;  // ストップビット1
+    tty.c_cflag &= ~CSIZE;   // データビット長クリア
+    tty.c_cflag |= CS8;      // 8データビット
+    tty.c_cflag &= ~CRTSCTS; // ハードウェアフロー制御なし
+    tty.c_cflag |= CREAD | CLOCAL; // 受信有効、モデム制御線無視
+
+    // ローカルフラグ設定 (Non-Canonical Mode)
+    tty.c_lflag &= ~ICANON;
+    tty.c_lflag &= ~ECHO;
+    tty.c_lflag &= ~ECHOE;
+    tty.c_lflag &= ~ECHONL;
+    tty.c_lflag &= ~ISIG;
+
+    // 入力フラグ設定
+    tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+    tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);
+
+    // 出力フラグ設定
+    tty.c_oflag &= ~OPOST;
+    tty.c_oflag &= ~ONLCR;
+
+    // 読み取りタイムアウト設定 (ここでは使わない)
+    tty.c_cc[VMIN] = 0;
+    tty.c_cc[VTIME] = 0;
+
+    // 設定を適用
+    if (tcsetattr(fd, TCSANOW, &tty) != 0) {
+        cerr << "[UART] Error from tcsetattr: " << strerror(errno) << endl;
+        close(fd);
+        return -1;
+    }
+
+    return fd;
 }
