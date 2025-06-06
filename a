@@ -1,0 +1,192 @@
+#include <iostream>
+#include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+
+#include <pigpio.h>
+
+#include <opencv2/core.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/videoio.hpp>
+#include <opencv2/imgproc.hpp>
+
+#include <vector>
+#include <thread>
+#include <chrono> // std::chrono を使うために追加
+
+using namespace std;
+using namespace cv;
+
+// グローバル定数として定義
+const char PC_IP[] = "192.168.23.5";
+const int RAS_RECV_PORT = 9001;
+const int PORT_PC_CAM1 = 8081;
+const int PORT_PC_CAM2 = 8082;
+const int BAUD_RATE = 9600;
+const int FPS = 20;
+
+void thread_cv(int port, int width, int height, int device_num, int quality_ratio);
+
+int main() {
+    // カメラ用スレッド開始
+    // thread th1(thread_cv, PORT_PC_CAM1, 640, 360, 0, 60);
+    thread th1(thread_cv, PORT_PC_CAM1, 1920/3, 1080/3, 0, 50);
+    th1.detach();
+
+    // UDPソケット作成
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        cerr << "[UDP] Socket creation failed" << endl;
+        return -1;
+    }
+
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(RAS_RECV_PORT);
+
+    if (bind(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        cerr << "[UDP] Bind failed" << endl;
+        close(sock);
+        return -1;
+    }
+
+    // ソケットを非ブロッキングモードに設定
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+    if (gpioInitialise() < 0) {
+        cerr << "[UART] pigpio initialization failed!" << endl;
+        return 1;
+    }
+
+    int serialHandle = serOpen((char*)"/dev/serial0", BAUD_RATE, 0);
+    if (serialHandle < 0) {
+        cerr << "[UART] Failed to open serial port!" << endl;
+        gpioTerminate();
+        return 1;
+    }
+
+    cout << "[UDP] Listening on port " << RAS_RECV_PORT << endl;
+    cout << "[UART] initialized at baud rate " << BAUD_RATE << endl;
+
+    const int MSG_NUM = 2;
+
+    while (true) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(sock, &readfds);
+        
+        timeval timeout{};
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 100000; // 100ms
+
+        int activity = select(sock + 1, &readfds, nullptr, nullptr, &timeout);
+        if (activity < 0) {
+            cerr << "select() error" << endl;
+            break;
+        }
+
+        // タイムアウトした場合: 定期データをシリアル送信
+        if (activity == 0) {
+            char dami_buffer[2] = { 'k', 0 };
+            if (serWrite(serialHandle, dami_buffer, MSG_NUM) < 0) {
+                cerr << "[UART] Failed to send periodic data!" << endl;
+            }
+            continue;
+        }
+
+        // UDPデータを受信した場合
+        if (FD_ISSET(sock, &readfds)) {
+            char buffer[16];
+            char latest_buffer[16] = {0};
+            sockaddr_in clientAddr{};
+            socklen_t addrLen = sizeof(clientAddr);
+            ssize_t len;
+
+            // ★修正点: バッファに溜まったデータを全て読み出し、最後のデータだけを処理する
+            // データがなくなるまでrecvfromを呼び出す (データがない場合、-1が返りループが終了する)
+            while ((len = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, (sockaddr*)&clientAddr, &addrLen)) > 0) {
+                buffer[len] = '\0';
+                strncpy(latest_buffer, buffer, sizeof(latest_buffer) - 1);
+            }
+
+            if (strlen(latest_buffer) > 0) {
+                cout << "[UDP] Latest Received: " << latest_buffer << endl;
+
+                if (serWrite(serialHandle, latest_buffer, MSG_NUM) < 0) {
+                    cerr << "[UART] Failed to send data!" << endl;
+                } else {
+                    printf("uart送信数:%d\n buffer[0]: %c , %u  buffer[1]: %c , %u\n",
+                           MSG_NUM, latest_buffer[0], (unsigned char)latest_buffer[0],
+                           latest_buffer[1], (unsigned char)latest_buffer[1]);
+                }
+            }
+        }
+    }
+
+    serClose(serialHandle);
+    gpioTerminate();
+    close(sock);
+    return 0;
+}
+
+void thread_cv(int port, int width, int height, int device_num, int quality_ratio) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        cerr << "[CAM_THREAD] Socket creation failed" << endl;
+        return;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = inet_addr(PC_IP);
+
+    VideoCapture cap(device_num);
+    cap.set(CAP_PROP_FRAME_WIDTH, width);
+    cap.set(CAP_PROP_FRAME_HEIGHT, height);
+    cap.set(CAP_PROP_FPS, FPS);
+
+    if (!cap.isOpened()) {
+        cout << "Camera not Found! Device: " << device_num << "\n";
+        return;
+    }
+
+    Mat frame;
+    vector<unsigned char> ibuff;
+    vector<int> param = { IMWRITE_JPEG_QUALITY, quality_ratio };
+    
+    // ★修正点: ループ条件を `while(true)` に変更。waitKeyは不要。
+    while (true) {
+        cap >> frame;
+        if (frame.empty()) {
+            cerr << "[CAM_THREAD] Failed to capture frame" << endl;
+            // 待機してからリトライ
+            std::this_thread::sleep_for(std::chrono::milliseconds(500)); 
+            continue;
+        }
+
+        imencode(".jpg", frame, ibuff, param);
+
+        // ★修正点: 実際のJPEGデータサイズで送信し、不要なデータコピーをやめる
+        // ibuff.data()でvectorの生ポインタを取得できる
+        if (!ibuff.empty()) {
+             sendto(sock, ibuff.data(), ibuff.size(), 0, (struct sockaddr*)&addr, sizeof(addr));
+        }
+        
+        // ★修正点: 不要なデコード処理を削除
+        // jpgimg = imdecode(Mat(ibuff), IMREAD_COLOR);
+
+        // ★修正点: CPUを過剰に消費しないよう、フレームレートに合わせて正確に待機する
+        // sleep(1/fps); は機能しないため、`std::this_thread::sleep_for` を使用する
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000 / FPS));
+    }
+
+    close(sock);
+    // capはデストラクタで自動的に解放される
+}
