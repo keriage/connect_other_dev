@@ -1,0 +1,24 @@
+            // 最後に受信したデータを保持するためのバッファ
+            char latest_buffer[16];
+
+            // まず、受信したデータをlatest_bufferにコピーする
+            buffer[len] = '\0';
+            strncpy(latest_buffer, buffer, sizeof(latest_buffer) - 1);
+            latest_buffer[sizeof(latest_buffer) - 1] = '\0'; // 安全のためのNULL終端
+
+            // さらに受信できるデータがなくなるまでループで読み出し、古いデータを破棄する
+            while (recvfrom(sock, buffer, sizeof(buffer) - 1, 0, nullptr, nullptr) > 0) {
+                // 新しいデータを受信するたびにlatest_bufferを上書きする
+                buffer[sizeof(buffer) - 1] = '\0';
+                strncpy(latest_buffer, buffer, sizeof(latest_buffer) - 1);
+                latest_buffer[sizeof(latest_buffer) - 1] = '\0';
+            }
+
+            // ループが終わった時点でlatest_bufferに残っているのがキューにあった最新のデータ
+            // この最新のデータだけをUARTに送信する
+            cout << "[UDP] Latest data processed: " << latest_buffer << endl;
+            ssize_t written = write(serial_fd, latest_buffer, MSG_NUM);
+            if (written < 0) {
+                cerr << "[UART] Failed to write to serial port!" << endl;
+            }
+            
