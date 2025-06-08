@@ -1,210 +1,174 @@
+// g++ -o udp_uart_optimized udp_uart_optimized.cpp -std=c++17 -pthread -lopencv_core -lopencv_videoio -lopencv_imgcodecs -O3
+
 #include <iostream>
-#include <cstring>
 #include <vector>
 #include <thread>
-#include <chrono>
-
-// --- 通信関連 ---
-#include <sys/socket.h>
+#include <cstring>
+#include <unistd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h> // write, read, close, usleep
-#include <fcntl.h>  // fcntl, O_RDWR, O_NOCTTY, O_NONBLOCK
-
-// --- シリアル通信関連 (termios) ---
+#include <sys/socket.h>
+#include <sys/mman.h>
+#include <sched.h>
+#include <fcntl.h>
 #include <termios.h>
 
-// --- OpenCV関連 ---
 #include <opencv2/core.hpp>
-#include <opencv2/highgui.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
-#include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 
-using namespace std;
-using namespace cv;
-
-// --- 設定 ---
-const char PC_IP[] = "192.168.23.5";
-const int RAS_RECV_PORT = 9001;
-const int PORT_PC_CAM1 = 8081;
-const int BAUD_RATE = B9600; // termios.hで定義されている定数を使用
+// --- 設定値 ---
+const char* PC_IP = "192.168.23.5";
+const int RASPI_RECV_PORT = 9001;
+const int PC_CAM_PORT = 8081;
+const char* UART_DEVICE = "/dev/serial0"; // Raspberry PiのハードウェアUART
+const int BAUD_RATE = B9600; // ★ご指定の9600bpsに設定
 const int FPS = 20;
 
-// --- プロトタイプ宣言 ---
-void thread_cv(int port, int width, int height, int device_num, int quality_ratio);
-int setup_serial_port(const char* port_name, speed_t baud_rate);
-
-// =================================================================
-//  メインスレッド: UDP受信 と UART送信 に特化
-// =================================================================
-int main() {
-    // --- カメラ用スレッドを開始 ---
-    thread th1(thread_cv, PORT_PC_CAM1, 1920 / 3, 1080 / 3, 0, 50);
-    th1.detach();
-
-    // --- UARTポートをセットアップ ---
-    int serial_fd = setup_serial_port("/dev/serial0", BAUD_RATE);
-    if (serial_fd < 0) {
-        return 1;
+// --- カメラ処理スレッド関数 ---
+// (内容は元のコードと同じですが、メイン処理から分離されています)
+void camera_thread_func(int port, int width, int height, int quality) {
+    // --- CPUコア2, 3に割り当て ---
+    pthread_t current_thread = pthread_self();
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(2, &cpuset); // Core 2
+    CPU_SET(3, &cpuset); // Core 3
+    if (pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset) != 0) {
+        std::cerr << "[Camera] Failed to set CPU affinity for camera thread" << std::endl;
     }
-    cout << "[UART] Serial port opened successfully." << endl;
-
-    // --- UDPソケットをセットアップ ---
+    
+    std::cout << "[Camera] Thread started on CPU 2,3" << std::endl;
+    
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        cerr << "[UDP] Socket creation failed" << endl;
-        return -1;
-    }
-
-    sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port = htons(RAS_RECV_PORT);
-
-    if (bind(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-        cerr << "[UDP] Bind failed" << endl;
-        close(sock);
-        return -1;
-    }
-
-    // ソケットを非ブロッキングモードに設定
-    fcntl(sock, F_SETFL, O_NONBLOCK);
-
-    cout << "[UDP] Listening on port " << RAS_RECV_PORT << endl;
-
-    // --- メインループ ---
-    char buffer[16];
-    const int MSG_NUM = 2;
-
-    while (true) {
-        // UDPソケットからデータをノンブロッキングで受信試行
-        ssize_t len = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, nullptr, nullptr);
-
-        if (len > 0) {
-            // データを受信した場合、UARTに送信
-            buffer[len] = '\0';
-            cout << "[UDP] Received: " << buffer << endl;
-            
-            // UARTポートに書き込む
-            ssize_t written = write(serial_fd, buffer, MSG_NUM);
-            if (written < 0) {
-                cerr << "[UART] Failed to write to serial port!" << endl;
-            }
-        }
-        
-        // CPUを100%消費しないように、非常に短い待機を入れる
-        usleep(1000); // 1ms待機
-    }
-
-    close(serial_fd);
-    close(sock);
-    return 0;
-}
-
-// =================================================================
-//  カメラ処理スレッド: 変更なし
-// =================================================================
-void thread_cv(int port, int width, int height, int device_num, int quality_ratio) {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        cerr << "[CAM_THREAD] Socket creation failed" << endl;
-        return;
-    }
-
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = inet_addr(PC_IP);
 
-    VideoCapture cap(device_num);
-    cap.set(CAP_PROP_FRAME_WIDTH, width);
-    cap.set(CAP_PROP_FRAME_HEIGHT, height);
-    cap.set(CAP_PROP_FPS, FPS);
+    cv::VideoCapture cap(0);
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, width);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, height);
+    cap.set(cv::CAP_PROP_FPS, FPS);
 
     if (!cap.isOpened()) {
-        cout << "[CAM_THREAD] Camera not found! Device: " << device_num << endl;
+        std::cerr << "[Camera] Camera not found!" << std::endl;
         return;
     }
 
-    Mat frame;
-    vector<unsigned char> ibuff;
-    vector<int> param = { IMWRITE_JPEG_QUALITY, quality_ratio };
-
+    cv::Mat frame;
+    std::vector<unsigned char> jpeg_buffer;
+    std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, quality};
+    
     while (true) {
         cap >> frame;
-        if (frame.empty()) {
-            cerr << "[CAM_THREAD] Failed to capture frame" << endl;
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            continue;
+        if (frame.empty()) continue;
+
+        cv::imencode(".jpg", frame, jpeg_buffer, params);
+
+        if (jpeg_buffer.size() < 65500) {
+            sendto(sock, jpeg_buffer.data(), jpeg_buffer.size(), 0, (struct sockaddr*)&addr, sizeof(addr));
         }
-
-        imencode(".jpg", frame, ibuff, param);
-
-        if (!ibuff.empty()) {
-            sendto(sock, ibuff.data(), ibuff.size(), 0, (struct sockaddr*)&addr, sizeof(addr));
-        }
-
         std::this_thread::sleep_for(std::chrono::milliseconds(1000 / FPS));
     }
     close(sock);
 }
 
 
-// =================================================================
-//  標準APIによるシリアルポート設定関数
-// =================================================================
-int setup_serial_port(const char* port_name, speed_t baud_rate) {
-    int fd = open(port_name, O_RDWR | O_NOCTTY);
-    if (fd < 0) {
-        cerr << "[UART] Error opening " << port_name << ": " << strerror(errno) << endl;
+int main() {
+    // --- 1. リアルタイム処理の準備 ---
+    
+    // メモリをロックしてページフォールトによる遅延を防止
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) == -1) {
+        std::cerr << "[Main] mlockall failed. Run with sudo." << std::endl;
         return -1;
     }
 
-    termios tty{};
-    if (tcgetattr(fd, &tty) != 0) {
-        cerr << "[UART] Error from tcgetattr: " << strerror(errno) << endl;
-        close(fd);
+    // メインスレッドをリアルタイム優先度に設定
+    sched_param sch_params;
+    sch_params.sched_priority = sched_get_priority_max(SCHED_FIFO);
+    if (sched_setscheduler(0, SCHED_FIFO, &sch_params) == -1) {
+        std::cerr << "[Main] Failed to set scheduler. Run with sudo." << std::endl;
         return -1;
     }
 
-    // ボーレート設定
-    cfsetospeed(&tty, baud_rate);
-    cfsetispeed(&tty, baud_rate);
+    // メインスレッドをCPUコア1に固定
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(1, &cpuset); // Core 1
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
+        std::cerr << "[Main] Failed to set CPU affinity" << std::endl;
+        return -1;
+    }
+    std::cout << "[Main] Real-time thread started on CPU 1" << std::endl;
 
-    // 制御フラグ設定
-    tty.c_cflag &= ~PARENB;  // パリティなし
-    tty.c_cflag &= ~CSTOPB;  // ストップビット1
-    tty.c_cflag &= ~CSIZE;   // データビット長クリア
-    tty.c_cflag |= CS8;      // 8データビット
-    tty.c_cflag &= ~CRTSCTS; // ハードウェアフロー制御なし
-    tty.c_cflag |= CREAD | CLOCAL; // 受信有効、モデム制御線無視
+    // --- 2. カメラ処理スレッドを起動 ---
+    // カメラ処理は低遅延要求ではないため、別スレッド・別コアで実行
+    std::thread camera_thread(camera_thread_func, PC_CAM_PORT, 1920 / 3, 1080 / 3, 50);
+    camera_thread.detach();
 
-    // ローカルフラグ設定 (Non-Canonical Mode)
-    tty.c_lflag &= ~ICANON;
-    tty.c_lflag &= ~ECHO;
-    tty.c_lflag &= ~ECHOE;
-    tty.c_lflag &= ~ECHONL;
-    tty.c_lflag &= ~ISIG;
-
-    // 入力フラグ設定
-    tty.c_iflag &= ~(IXON | IXOFF | IXANY);
-    tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);
-
-    // 出力フラグ設定
-    tty.c_oflag &= ~OPOST;
-    tty.c_oflag &= ~ONLCR;
-
-    // 読み取りタイムアウト設定 (ここでは使わない)
-    tty.c_cc[VMIN] = 0;
-    tty.c_cc[VTIME] = 0;
-
-    // 設定を適用
-    if (tcsetattr(fd, TCSANOW, &tty) != 0) {
-        cerr << "[UART] Error from tcsetattr: " << strerror(errno) << endl;
-        close(fd);
+    // --- 3. UDPソケットの初期化 ---
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        std::cerr << "[UDP] Socket creation failed" << std::endl;
         return -1;
     }
 
-    return fd;
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(RASPI_RECV_PORT);
+
+    if (bind(sock, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        std::cerr << "[UDP] Bind failed" << std::endl;
+        close(sock);
+        return -1;
+    }
+
+    // --- 4. UARTの初期化 (termiosを使用) ---
+    int serial_fd = open(UART_DEVICE, O_RDWR | O_NOCTTY | O_NDELAY);
+    if (serial_fd == -1) {
+        std::cerr << "[UART] Failed to open serial port" << std::endl;
+        return -1;
+    }
+
+    termios tio{};
+    tcgetattr(serial_fd, &tio);
+    cfsetospeed(&tio, BAUD_RATE);
+    cfsetispeed(&tio, BAUD_RATE);
+    tio.c_cflag &= ~PARENB;
+    tio.c_cflag &= ~CSTOPB;
+    tio.c_cflag &= ~CSIZE;
+    tio.c_cflag |= CS8;
+    tio.c_cflag &= ~CRTSCTS;
+    tio.c_cflag |= CREAD | CLOCAL;
+    tio.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    tio.c_oflag &= ~OPOST;
+    tio.c_cc[VMIN] = 0; // Read()がブロックしないように設定
+    tio.c_cc[VTIME] = 0;
+    tcflush(serial_fd, TCIFLUSH);
+    tcsetattr(serial_fd, TCSANOW, &tio);
+
+    std::cout << "[Main] UDP listening on port " << RASPI_RECV_PORT << std::endl;
+    std::cout << "[Main] UART initialized on " << UART_DEVICE << " at 9600 bps" << std::endl;
+
+    // --- 5. メインループ (UDP受信 → 即UART送信) ---
+    char buffer[16];
+    while (true) {
+        // UDPデータを受信するまでブロック
+        ssize_t len = recvfrom(sock, buffer, sizeof(buffer), 0, nullptr, nullptr);
+
+        if (len >= 2) {
+            // 受信後、即座にUARTへ書き込む (キューやスレッド切り替えなし)
+            ssize_t written = write(serial_fd, buffer, 2);
+            if (written < 0) {
+                std::cerr << "[UART] Failed to write to serial port!" << std::endl;
+            }
+        }
+    }
+
+    // --- クリーンアップ ---
+    close(sock);
+    close(serial_fd);
+    return 0;
 }
