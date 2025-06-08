@@ -5,21 +5,18 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
-
 #include <pigpio.h>
-
 #include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
 #include <opencv2/imgproc.hpp>
-
 #include <vector>
 #include <thread>
+#include <array>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
-#include <array>
 
 using namespace std;
 using namespace cv;
@@ -31,34 +28,13 @@ int baudRate = 9600;
 int fps = 20;
 int msgNum = 2;
 
+queue<array<char, 2>> uartQueue;
+mutex uartMutex;
+condition_variable uartCV;
+bool running = true;
+
 void thread_cv(int port, int WIDTH, int HEIGHT, int num, int ratio);
-
-queue<array<char, 16>> uart_queue;
-mutex uart_mutex;
-condition_variable uart_cv;
-bool uart_running = true;
-
-void uart_sender_thread(int serialHandle) {
-    while (uart_running) {
-        unique_lock<mutex> lock(uart_mutex);
-        uart_cv.wait(lock, [] { return !uart_queue.empty() || !uart_running; });
-
-        while (!uart_queue.empty()) {
-            auto msg = uart_queue.front();
-            uart_queue.pop();
-            lock.unlock();
-
-            int result = serWrite(serialHandle, msg.data(), msgNum);
-            if (result < 0) {
-                cerr << "[UART]Failed to send data!" << endl;
-            } else {
-                printf("UART sent: %c %c\n", msg[0], msg[1]);
-            }
-
-            lock.lock();
-        }
-    }
-}
+void uart_thread(int serialHandle);
 
 int main() {
     thread th1(thread_cv, port_pc_cam1, 1920 / 3, 1080 / 3, 0, 50);
@@ -81,13 +57,6 @@ int main() {
         return -1;
     }
 
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-
-    fd_set readfds;
-    sockaddr_in clientAddr{};
-    socklen_t addrLen = sizeof(clientAddr);
-
     if (gpioInitialise() < 0) {
         cerr << "[UART]pigpio initialization failed!" << endl;
         return 1;
@@ -100,51 +69,61 @@ int main() {
         return 1;
     }
 
-    thread uart_thread(uart_sender_thread, serialHandle);
+    thread uartTh(uart_thread, serialHandle);
 
     cout << "[UDP]Listening on port " << ras_recv_port << endl;
+    cout << "[UART] initialized at baud rate " << baudRate << endl;
+
+    sockaddr_in clientAddr{};
+    socklen_t addrLen = sizeof(clientAddr);
 
     while (true) {
-        FD_ZERO(&readfds);
-        FD_SET(sock, &readfds);
-        timeval timeout{};
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 5000;
-
-        int activity = select(sock + 1, &readfds, nullptr, nullptr, &timeout);
-        if (activity < 0) {
-            cerr << "select() error" << endl;
-            break;
-        }
-
-        if (activity == 0) continue;
-
-        if (FD_ISSET(sock, &readfds)) {
-            char buffer[16] = {0};
-            ssize_t len = recvfrom(sock, buffer, sizeof(buffer) - 1, 0,
-                                   (sockaddr*)&clientAddr, &addrLen);
-            if (len > 0) {
-                buffer[len] = '\0';
-                array<char, 16> msg{};
-                strncpy(msg.data(), buffer, 16);
-
+        char buffer[16] = {0};
+        ssize_t len = recvfrom(sock, buffer, sizeof(buffer) - 1, 0,
+                               (sockaddr*)&clientAddr, &addrLen);
+        if (len > 0) {
+            buffer[len] = '\0';
+            if (len >= msgNum) {
+                array<char, 2> msg = { buffer[0], buffer[1] };
                 {
-                    lock_guard<mutex> lock(uart_mutex);
-                    uart_queue.push(msg);
+                    lock_guard<mutex> lock(uartMutex);
+                    uartQueue.push(msg);
                 }
-                uart_cv.notify_one();
+                uartCV.notify_one();
             }
         }
+        usleep(1000);
     }
 
-    uart_running = false;
-    uart_cv.notify_one();
-    uart_thread.join();
-
+    running = false;
+    uartCV.notify_all();
+    uartTh.join();
     serClose(serialHandle);
     gpioTerminate();
     close(sock);
     return 0;
+}
+
+void uart_thread(int serialHandle) {
+    while (running) {
+        unique_lock<mutex> lock(uartMutex);
+        uartCV.wait(lock, [] { return !uartQueue.empty() || !running; });
+
+        while (!uartQueue.empty()) {
+            auto msg = uartQueue.front();
+            uartQueue.pop();
+            lock.unlock();
+
+            int result = serWrite(serialHandle, msg.data(), msgNum);
+            if (result < 0) {
+                cerr << "[UART]Failed to send data!" << endl;
+            } else {
+                printf("UART sent: %c %c\n", msg[0], msg[1]);
+            }
+
+            lock.lock();
+        }
+    }
 }
 
 void thread_cv(int port, int WIDTH, int HEIGHT, int num, int ratio) {
